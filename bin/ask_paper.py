@@ -33,8 +33,10 @@ EXTRACT_SCRIPT = str(SCRIPT_DIR / "extract_pdf.py")
 DEFAULT_SERVICE = "qwen35-vllm.service"
 
 MODELS = [
-    {"service": "qwen35-vllm.service", "port": 8000, "model": "Qwen3.5-27B-FP8", "vision": True, "suffix": "qwen"},
-    {"service": "gptoss-vllm.service", "port": 8001, "model": "gpt-oss-20b", "vision": False, "suffix": "gptoss"},
+    {"service": "qwen35-vllm.service", "port": 8000, "model": "Qwen3.5-27B-FP8", "vision": True,
+     "suffix": "qwen", "max_tokens": 4096, "reasoning_effort": "none"},
+    {"service": "gptoss-vllm.service", "port": 8001, "model": "gpt-oss-20b", "vision": False,
+     "suffix": "gptoss", "max_tokens": 8192, "reasoning_effort": "high"},
 ]
 
 
@@ -64,7 +66,8 @@ def switch_to(service: str, port: int, timeout: float = 180.0):
     raise TimeoutError(f"{service} did not become healthy within {timeout}s")
 
 
-def ask(port: int, model: str, paper_text: str, question: str, images: list[Path] | None = None) -> str:
+def ask(port: int, model: str, paper_text: str, question: str, images: list[Path] | None = None,
+        max_tokens: int = 4096, reasoning_effort: str = "none") -> str:
     api_key = API_KEY_PATH.read_text().strip()
     client = OpenAI(base_url=f"http://localhost:{port}/v1", api_key=api_key)
 
@@ -92,8 +95,8 @@ def ask(port: int, model: str, paper_text: str, question: str, images: list[Path
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
-        max_tokens=4096,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        max_tokens=max_tokens,
+        extra_body={"reasoning_effort": reasoning_effort},
     )
     choice = resp.choices[0]
     content = choice.message.content
@@ -143,7 +146,8 @@ def main():
             switch_to(entry["service"], entry["port"])
             print(f"[asking {entry['model']}]", file=sys.stderr)
             model_imgs = imgs if entry["vision"] else []
-            answer = ask(entry["port"], entry["model"], paper_text, args.question, model_imgs)
+            answer = ask(entry["port"], entry["model"], paper_text, args.question, model_imgs,
+                         max_tokens=entry["max_tokens"], reasoning_effort=entry["reasoning_effort"])
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             llm_path = out_dir / f"{stem}.{entry['suffix']}.llm"
             llm_path.write_text(f"[{timestamp}][{entry['model']}]\n{answer}\n")

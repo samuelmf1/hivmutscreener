@@ -45,12 +45,18 @@ DEFAULT_QUESTION = (
     "(> 100 percent on whatever variable is being studied)"
 )
 
-# max_num_seqs on each vLLM service, minus safety margin
+# concurrency: max_num_seqs on each vLLM service, minus safety margin
+# reasoning_effort: gpt-oss ignores Qwen's enable_thinking template kwarg, so use the
+# universal top-level reasoning_effort param for both. gpt-oss needs "high" to reliably
+# parse this paper's tables correctly (lower efforts sometimes missed entries), which in
+# turn needs a bigger max_tokens budget than its default reasoning uses.
 MODELS = [
     {"service": "qwen35-vllm.service", "port": 8000, "model": "Qwen3.5-27B-FP8",
-     "vision": True, "suffix": "qwen", "concurrency": 150},
+     "vision": True, "suffix": "qwen", "concurrency": 150,
+     "max_tokens": 4096, "reasoning_effort": "none"},
     {"service": "gptoss-vllm.service", "port": 8001, "model": "gpt-oss-20b",
-     "vision": False, "suffix": "gptoss", "concurrency": 100},
+     "vision": False, "suffix": "gptoss", "concurrency": 100,
+     "max_tokens": 8192, "reasoning_effort": "high"},
 ]
 
 
@@ -151,8 +157,8 @@ async def ask_one(client: AsyncOpenAI, entry: dict, stem: str, question: str, se
             resp = await client.chat.completions.create(
                 model=entry["model"],
                 messages=[{"role": "user", "content": content}],
-                max_tokens=4096,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                max_tokens=entry["max_tokens"],
+                extra_body={"reasoning_effort": entry["reasoning_effort"]},
                 timeout=300,
             )
         except Exception as e:
