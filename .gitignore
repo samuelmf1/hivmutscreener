@@ -11,3 +11,9 @@ __pycache__/
 
 # Editor/OS
 .DS_Store
+
+# Secrets, never committed
+.env
+.env.*
+
+cookies.txt

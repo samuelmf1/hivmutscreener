@@ -9,6 +9,7 @@ paywall bypassing or anti-bot circumvention.
 """
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -18,9 +19,29 @@ from urllib.parse import quote, urlparse
 USER_AGENT = "Mozilla/5.0 (compatible; PaperFetcher/1.0)"
 IDCONV_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={ids}&format=json"
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={query}&format=json&resultType=core"
+EUROPEPMC_GET_PDF_URL = "https://europepmc.org/api/getPdf?pmcid={pmcid}"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={pmid}&format=json"
 UNPAYWALL_URL = "https://api.unpaywall.org/v2/{doi}?email={email}"
 CROSSREF_URL = "https://api.crossref.org/works/{doi}"
+# Fallback DOI resolver for when NCBI's own ID Converter has no mapping --
+# empirically, noticeably more complete: every PMID sampled where IDCONV
+# came back with doi=None, OpenAlex still had a DOI for. Matters a lot here
+# since every source below except CORE's pubmedId branch is DOI-gated.
+OPENALEX_URL = "https://api.openalex.org/works/pmid:{pmid}"
+
+# Additional, longer-tail OA sources -- only worth querying if the cheap/
+# authoritative ones above (PMC Open Data, Europe PMC, Unpaywall) came up
+# empty, see the short-circuit in find_oa_pdf_candidates().
+# id goes directly in the path as e.g. "DOI:10.1234/x" or "PMID:12345", no
+# extra wrapping -- https://api.semanticscholar.org/api-docs/graph
+SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1/paper/{external_id}?fields=openAccessPdf"
+# v2 was retired; v3 works unauthenticated but capped at 10 req/min (headers
+# confirm this), a free key at core.ac.uk/services/api raises that a lot.
+# Trailing slash before the query string is required -- CORE 301s without it.
+CORE_API_URL = "https://api.core.ac.uk/v3/search/works/?q={query}"
+CORE_API_KEY = os.environ.get("CORE_API_KEY")
+DOAJ_URL = "https://doaj.org/api/search/articles/{query}"
+ARXIV_URL = "https://export.arxiv.org/api/query?search_query=doi:{doi}&max_results=1"
 
 # NCBI's own sanctioned bulk-retrieval channel for PMC content licensed for
 # redistribution (the "PMC Article Datasets" on AWS Open Data) -- anonymous,
@@ -48,6 +69,13 @@ FREE_CONTENT_HOSTS = (
     "doaj.org",
     "plos.org",
     "ncbi.gov",
+    "core.ac.uk",
+    "osf.io",
+    "figshare.com",
+    # NOT researchgate.net / academia.edu: those host uploads without
+    # verifying the uploader had rights to redistribute, unlike the
+    # repositories above -- doesn't fit this module's "explicitly flagged as
+    # OA" policy (see module docstring), so don't auto-trust their hostname.
 )
 
 
@@ -149,10 +177,24 @@ def resolve_ids(kind, value):
     return result
 
 
-def resolve_ids_batch(pmids):
+def resolve_doi_openalex(pmid):
+    """Single-PMID DOI lookup via OpenAlex, for when NCBI's ID Converter
+    doesn't have one (see OPENALEX_URL comment)."""
+    try:
+        data = http_get_json(OPENALEX_URL.format(pmid=pmid))
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
+        return None
+    doi_url = data.get("doi") or ""
+    return doi_url.rsplit("doi.org/", 1)[-1] if doi_url else None
+
+
+def resolve_ids_batch(pmids, openalex_fallback=True):
     """Resolve many PMIDs to {pmid, pmcid, doi} in chunks of IDCONV_BATCH_SIZE.
-    Returns {pmid: {"pmid":.., "pmcid":.., "doi":..}}; missing/unresolved
-    PMIDs are simply absent from the result rather than raising."""
+    Returns {pmid: {"pmid":.., "pmcid":.., "doi":..}}; a PMID NCBI has no
+    record for at all is simply absent rather than raising, but one NCBI
+    knows about minus a DOI still gets an OpenAlex fallback attempt (one
+    request each, so this is the slow part for a PMID-heavy batch -- pass
+    openalex_fallback=False to skip it if that's not worth the time)."""
     out = {}
     pmids = list(pmids)
     for i in range(0, len(pmids), IDCONV_BATCH_SIZE):
@@ -170,6 +212,20 @@ def resolve_ids_batch(pmids):
                 "pmcid": rec.get("pmcid"),
                 "doi": rec.get("doi"),
             }
+
+    if openalex_fallback:
+        for pmid in pmids:
+            entry = out.get(pmid)
+            if entry and entry.get("doi"):
+                continue
+            doi = resolve_doi_openalex(pmid)
+            if not doi:
+                continue
+            if entry:
+                entry["doi"] = doi
+            else:
+                out[pmid] = {"pmid": pmid, "pmcid": None, "doi": doi}
+
     return out
 
 
@@ -258,6 +314,90 @@ def find_unpaywall_pdfs(doi, email):
     return candidates, landing
 
 
+def find_semantic_scholar_pdfs(doi):
+    """Search Semantic Scholar for an OA PDF by DOI. One request: the
+    external-id lookup already returns full paper fields directly, no need
+    for a second call by internal paperId."""
+    if not doi:
+        return []
+    try:
+        url = SEMANTIC_SCHOLAR_URL.format(external_id=quote(f"DOI:{doi}", safe=":/"))
+        data = http_get_json(url)
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
+        return []
+    oa_pdf = data.get("openAccessPdf")
+    url_link = oa_pdf.get("url") if isinstance(oa_pdf, dict) else None
+    return [url_link] if url_link else []
+
+
+def _core_search(query):
+    headers = {"Authorization": f"Bearer {CORE_API_KEY}"} if CORE_API_KEY else {}
+    try:
+        data = http_get_json(CORE_API_URL.format(query=quote(query)), headers=headers)
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
+        return []
+    candidates = []
+    for work in data.get("results", []):
+        if work.get("downloadUrl"):
+            candidates.append(work["downloadUrl"])
+        candidates.extend(work.get("sourceFulltextUrls") or [])
+    return candidates
+
+
+def find_core_ac_pdfs(doi=None, pmid=None):
+    """Search CORE (aggregates repository-hosted copies) for a PDF by DOI or
+    PMID. Works unauthenticated but rate-limited to 10 req/min; set
+    CORE_API_KEY (free signup at core.ac.uk/services/api) for real bulk use."""
+    candidates = []
+    if doi:
+        candidates.extend(_core_search(f"doi:{doi}"))
+    if pmid:
+        candidates.extend(c for c in _core_search(f"pubmedId:{pmid}") if c not in candidates)
+    return candidates
+
+
+def find_doaj_pdfs(doi):
+    """Search DOAJ (Directory of Open Access Journals -- fully-OA journals
+    only, so any fulltext link found here is safe to treat as OA)."""
+    if not doi:
+        return []
+    try:
+        url = DOAJ_URL.format(query=quote(f"doi:{doi}", safe=""))
+        data = http_get_json(url)
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
+        return []
+    urls = []
+    for article in data.get("results", []):
+        for link in article.get("bibjson", {}).get("link", []):
+            if link.get("type") == "fulltext" and link.get("url"):
+                urls.append(link["url"])
+    return urls
+
+
+def find_arxiv_pdfs(doi):
+    """Search arXiv for papers by DOI and get PDF URLs."""
+    if not doi:
+        return []
+    try:
+        url = ARXIV_URL.format(doi=quote(doi))
+        data, _ = http_get(url)
+        root = ET.fromstring(data)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        entries = root.findall("atom:entry", ns)
+        pdfs = []
+        for entry in entries:
+            for link in entry.findall("atom:link", ns):
+                rel = link.get("rel")
+                href = link.get("href")
+                if rel == "related" and "pdf" in href.lower():
+                    pdfs.append(href)
+                if rel == "alternate" and href.endswith(".pdf"):
+                    pdfs.append(href)
+        return pdfs
+    except (urllib.error.URLError, urllib.error.HTTPError, ET.ParseError):
+        return []
+
+
 def download_pdf(url, dest_path):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -302,21 +442,40 @@ def find_oa_pdf_candidates(pmid=None, pmcid=None, doi=None, email=None):
     candidates = []
     landing_url = None
 
+    # 1. PMC Open Data & Europe PMC PDF endpoint (highest priority for PMC content)
     if pmcid:
         opendata_candidates = find_pmc_opendata_pdfs(pmcid)
         candidates.extend(c for c in opendata_candidates if c not in candidates)
+        # Direct Europe PMC rendered PDF endpoint (official open mirror for PMC content)
+        epmc_direct = EUROPEPMC_GET_PDF_URL.format(pmcid=pmcid)
+        if epmc_direct not in candidates:
+            candidates.append(epmc_direct)
         landing_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
 
+    # 2. Europe PMC (OA papers only)
     if pmid or pmcid or doi:
         epmc_candidates = find_europepmc_pdfs(pmid=pmid, pmcid=pmcid, doi=doi)
         candidates.extend(c for c in epmc_candidates if c not in candidates)
         if pmcid:
             landing_url = landing_url or f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
 
+    # 3. Unpaywall (legitimate OA from repositories)
     if doi and email:
         unpaywall_candidates, unpaywall_landing = find_unpaywall_pdfs(doi, email)
         candidates.extend(c for c in unpaywall_candidates if c not in candidates)
         landing_url = landing_url or unpaywall_landing
+
+    # 4-7: longer-tail sources, several of them tightly rate-limited
+    # (Semantic Scholar, CORE unauthenticated) -- only worth spending that
+    # budget on papers the sources above didn't already resolve.
+    if not candidates and doi:
+        candidates.extend(c for c in find_semantic_scholar_pdfs(doi) if c not in candidates)
+    if not candidates and (doi or pmid):
+        candidates.extend(c for c in find_core_ac_pdfs(doi=doi, pmid=pmid) if c not in candidates)
+    if not candidates and doi:
+        candidates.extend(c for c in find_doaj_pdfs(doi) if c not in candidates)
+    if not candidates and doi:
+        candidates.extend(c for c in find_arxiv_pdfs(doi) if c not in candidates)
 
     if not landing_url:
         landing_url = f"https://doi.org/{doi}" if doi else None
