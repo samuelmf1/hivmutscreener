@@ -45,17 +45,29 @@ DEFAULT_QUESTION = (
     "(> 100 percent on whatever variable is being studied)"
 )
 
-# concurrency: max_num_seqs on each vLLM service, minus safety margin
+# concurrency: NOT max_num_seqs - vLLM can only actually run as many requests
+# concurrently as fit in its KV cache, which for Qwen (full paper text + table
+# images per request) turned out to be ~3-6 in practice even though
+# max_num_seqs=200 and this was set to 150. The other ~145 in-flight requests
+# just sat in the server's queue burning wall-clock until the client-side
+# timeout below killed them - that's what caused a 92% failure rate on a real
+# run (see git history). Keep this close to the real steady-state "Running"
+# count from the vLLM engine log (`journalctl --user -u <service>`), not
+# max_num_seqs. gpt-oss (text-only, no images) has a much smaller per-request
+# KV footprint and really does sustain ~70-80 concurrent, so it can stay high.
+# timeout: per-request client timeout; must comfortably exceed the time a
+# request can spend queued behind `concurrency` others ahead of it, not just
+# the time to actually generate an answer.
 # reasoning_effort: gpt-oss ignores Qwen's enable_thinking template kwarg, so use the
 # universal top-level reasoning_effort param for both. gpt-oss needs "high" to reliably
 # parse this paper's tables correctly (lower efforts sometimes missed entries), which in
 # turn needs a bigger max_tokens budget than its default reasoning uses.
 MODELS = [
     {"service": "qwen35-vllm.service", "port": 8000, "model": "Qwen3.5-27B-FP8",
-     "vision": True, "suffix": "qwen", "concurrency": 150,
+     "vision": True, "suffix": "qwen", "concurrency": 10, "timeout": 1800,
      "max_tokens": 4096, "reasoning_effort": "none"},
     {"service": "gptoss-vllm.service", "port": 8001, "model": "gpt-oss-20b",
-     "vision": False, "suffix": "gptoss", "concurrency": 100,
+     "vision": False, "suffix": "gptoss", "concurrency": 100, "timeout": 900,
      "max_tokens": 8192, "reasoning_effort": "high"},
 ]
 
@@ -66,7 +78,7 @@ def log(msg: str):
 
 # ---------- Phase 1: extraction ----------
 
-def extract_one(pdf_path: Path) -> tuple[str, bool, str]:
+def extract_one(pdf_path: Path, timeout: int) -> tuple[str, bool, str]:
     stem = pdf_path.stem
     out_dir = EXTRACTED_ROOT / stem
     text_path = out_dir / f"{stem}.txt"
@@ -78,12 +90,12 @@ def extract_one(pdf_path: Path) -> tuple[str, bool, str]:
     try:
         result = subprocess.run(
             [PDFEXTRACT_PY, EXTRACT_SCRIPT, str(pdf_path), "--image-dir", str(image_dir)],
-            capture_output=True, text=True, check=True, timeout=600,
+            capture_output=True, text=True, check=True, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
         return stem, False, f"docling failed: {e.stderr[-500:]}"
     except subprocess.TimeoutExpired:
-        return stem, False, "docling timed out after 600s"
+        return stem, False, f"docling timed out after {timeout}s"
 
     text = result.stdout
     if not text.strip():
@@ -92,11 +104,12 @@ def extract_one(pdf_path: Path) -> tuple[str, bool, str]:
     return stem, True, "ok"
 
 
-def run_extraction(pdfs: list[Path], workers: int):
-    log(f"Phase 1: extracting {len(pdfs)} PDF(s) with {workers} parallel workers")
+def run_extraction(pdfs: list[Path], workers: int, timeout: int):
+    log(f"Phase 1: extracting {len(pdfs)} PDF(s) with {workers} parallel workers "
+        f"(timeout={timeout}s)")
     ok, failed = 0, []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(extract_one, p): p for p in pdfs}
+        futures = {pool.submit(extract_one, p, timeout): p for p in pdfs}
         for i, fut in enumerate(as_completed(futures), 1):
             stem, success, msg = fut.result()
             if success:
@@ -138,6 +151,12 @@ async def ask_one(client: AsyncOpenAI, entry: dict, stem: str, question: str, se
     paper_text = text_path.read_text()
     imgs = table_images(stem) if entry["vision"] else []
 
+    # Context guard: skip paper if estimated tokens exceed model context limit (65536)
+    # Approx: 1 token ~= 3.5 chars of technical text; table images ~= 1000 tokens each.
+    est_tokens = len(paper_text) / 3.5 + len(imgs) * 1000 + entry["max_tokens"] + 500
+    if est_tokens > 64_000:
+        return stem, False, f"skipped: prompt exceeds context limit (~{int(est_tokens)} tokens)"
+
     prompt = (
         f"Here is the full text of a scientific paper:\n\n<paper>\n{paper_text}\n</paper>\n\n"
     )
@@ -159,7 +178,7 @@ async def ask_one(client: AsyncOpenAI, entry: dict, stem: str, question: str, se
                 messages=[{"role": "user", "content": content}],
                 max_tokens=entry["max_tokens"],
                 extra_body={"reasoning_effort": entry["reasoning_effort"]},
-                timeout=300,
+                timeout=entry["timeout"],
             )
         except Exception as e:
             return stem, False, f"request failed: {e}"
@@ -217,6 +236,9 @@ def main():
     parser.add_argument("-q", "--question", default=DEFAULT_QUESTION)
     parser.add_argument("--extract-workers", type=int, default=12,
                          help="Parallel Docling extraction workers (CPU-bound, default 12)")
+    parser.add_argument("--extract-timeout", type=int, default=1800,
+                         help="Per-PDF Docling timeout in seconds (default 1800; large "
+                              "multi-hundred-page PDFs like conference abstract books need it)")
     parser.add_argument("--skip-extraction", action="store_true")
     parser.add_argument("--only-model", choices=[m["suffix"] for m in MODELS], default=None,
                          help="Run only one model's pass instead of both")
@@ -228,7 +250,7 @@ def main():
     log(f"{len(pdfs)} PDF(s) to process")
 
     if not args.skip_extraction:
-        run_extraction(pdfs, args.extract_workers)
+        run_extraction(pdfs, args.extract_workers, args.extract_timeout)
 
     stems = [p.stem for p in pdfs if (EXTRACTED_ROOT / p.stem / f"{p.stem}.txt").exists()]
     log(f"{len(stems)} paper(s) have extracted text and are ready for LLM passes")
