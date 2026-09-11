@@ -65,10 +65,10 @@ DEFAULT_QUESTION = (
 # turn needs a bigger max_tokens budget than its default reasoning uses.
 MODELS = [
     {"service": "qwen35-vllm.service", "port": 8000, "model": "Qwen3.5-27B-FP8",
-     "vision": True, "suffix": "qwen", "concurrency": 10, "timeout": 1800,
+     "vision": True, "suffix": "qwen", "concurrency": 10, "timeout": 3600,
      "max_tokens": 4096, "reasoning_effort": "none"},
     {"service": "gptoss-vllm.service", "port": 8001, "model": "gpt-oss-20b",
-     "vision": False, "suffix": "gptoss", "concurrency": 100, "timeout": 900,
+     "vision": False, "suffix": "gptoss", "concurrency": 100, "timeout": 1800,
      "max_tokens": 8192, "reasoning_effort": "high"},
 ]
 
@@ -240,8 +240,8 @@ def main():
     parser.add_argument("-q", "--question", default=DEFAULT_QUESTION)
     parser.add_argument("--extract-workers", type=int, default=12,
                          help="Parallel Docling extraction workers (CPU-bound, default 12)")
-    parser.add_argument("--extract-timeout", type=int, default=1800,
-                         help="Per-PDF Docling timeout in seconds (default 1800; large "
+    parser.add_argument("--extract-timeout", type=int, default=3600,
+                         help="Per-PDF Docling timeout in seconds (default 3600; large "
                               "multi-hundred-page PDFs like conference abstract books need it)")
     parser.add_argument("--skip-extraction", action="store_true")
     parser.add_argument("--only-model", choices=[m["suffix"] for m in MODELS], default=None,
