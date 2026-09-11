@@ -121,7 +121,7 @@ def run_extraction(pdfs: list[Path], workers: int, timeout: int):
             else:
                 failed.append((stem, msg))
                 log(f"  FAILED {stem}: {msg}")
-            if i % 25 == 0 or i == len(pdfs):
+            if i % 5 == 0 or i == len(pdfs):
                 log(f"  extraction progress: {i}/{len(pdfs)} ({ok} ok, {len(failed)} failed)")
     log(f"Phase 1 done: {ok} ok, {len(failed)} failed")
     return failed
@@ -221,7 +221,7 @@ async def run_llm_pass_async(entry: dict, stems: list[str], question: str):
         else:
             failed.append((stem, msg))
             log(f"  FAILED {stem} [{entry['model']}]: {msg}")
-        if done % 25 == 0 or done == len(pending):
+        if done % 5 == 0 or done == len(pending):
             log(f"  {entry['model']} progress: {done}/{len(pending)} ({ok} ok, {len(failed)} failed)")
     return failed
 
@@ -240,8 +240,8 @@ def main():
     parser.add_argument("-q", "--question", default=DEFAULT_QUESTION)
     parser.add_argument("--extract-workers", type=int, default=12,
                          help="Parallel Docling extraction workers (CPU-bound, default 12)")
-    parser.add_argument("--extract-timeout", type=int, default=3600,
-                         help="Per-PDF Docling timeout in seconds (default 3600; large "
+    parser.add_argument("--extract-timeout", type=int, default=7200,
+                         help="Per-PDF Docling timeout in seconds (default 7200 [2h]; large "
                               "multi-hundred-page PDFs like conference abstract books need it)")
     parser.add_argument("--skip-extraction", action="store_true")
     parser.add_argument("--only-model", choices=[m["suffix"] for m in MODELS], default=None,
