@@ -23,6 +23,7 @@ Output layout matches ask_paper.py:
 import argparse
 import asyncio
 import base64
+import os
 import subprocess
 import sys
 import time
@@ -87,10 +88,13 @@ def extract_one(pdf_path: Path, timeout: int) -> tuple[str, bool, str]:
 
     image_dir = out_dir / "images"
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Force Docling/PyTorch onto CPU so 32 parallel workers don't fight vLLM for GPU VRAM
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     try:
         result = subprocess.run(
             [PDFEXTRACT_PY, EXTRACT_SCRIPT, str(pdf_path), "--image-dir", str(image_dir)],
             capture_output=True, text=True, check=True, timeout=timeout,
+            env=env,
         )
     except subprocess.CalledProcessError as e:
         return stem, False, f"docling failed: {e.stderr[-500:]}"
